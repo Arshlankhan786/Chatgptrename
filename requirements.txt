@@ -1,0 +1,2 @@
+pyrogram==2.0.78
+pymongo==4.1.1
