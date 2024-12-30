@@ -1,15 +1,17 @@
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import os
 import asyncio
-import zipfile
-from moviepy.editor import VideoFileClip
-from PIL import Image
-from config import API_ID, API_HASH, BOT_TOKEN, TEMP_DOWNLOAD_PATH, MAX_FILE_SIZE_MB
+import datetime
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pymongo import MongoClient
+from config import API_ID, API_HASH, BOT_TOKEN, TEMP_DOWNLOAD_PATH, MAX_FILE_SIZE_MB, MONGO_URI, DB_NAME
 
+# Initialize bot and MongoDB client
 app = Client("multi_feature_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-renamed_files = {}  # Stores renamed file info {file_id: new_name}
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client[DB_NAME]
+users_collection = db["users"]
+files_collection = db["files"]
 
 # Ensure temporary download path exists
 os.makedirs(TEMP_DOWNLOAD_PATH, exist_ok=True)
@@ -20,53 +22,76 @@ def get_file_size_in_mb(size_in_bytes):
     return size_in_bytes / (1024 * 1024)
 
 
-async def download_file(file_id, file_name):
-    """Downloads the file to TEMP_DOWNLOAD_PATH"""
-    download_path = os.path.join(TEMP_DOWNLOAD_PATH, file_name)
-    return await app.download_media(file_id, file_name=download_path)
+def is_premium(user_id):
+    """Check if a user is premium."""
+    user = users_collection.find_one({"user_id": user_id})
+    if user and "premium_expiry" in user:
+        expiry_date = user["premium_expiry"]
+        return datetime.datetime.now() < expiry_date
+    return False
 
 
-def compress_file(file_path, compressed_name):
-    """Compresses a file into a ZIP archive"""
-    compressed_path = f"{compressed_name}.zip"
-    with zipfile.ZipFile(compressed_path, "w") as zipf:
-        zipf.write(file_path, arcname=os.path.basename(file_path))
-    return compressed_path
+def add_premium_plan(user_id, plan):
+    """Add premium plan to user."""
+    expiry_date = None
+    if plan == "silver":
+        expiry_date = datetime.datetime.now() + datetime.timedelta(days=7)
+    elif plan == "gold":
+        expiry_date = datetime.datetime.now() + datetime.timedelta(days=15)
+    elif plan == "platinum":
+        expiry_date = datetime.datetime.now() + datetime.timedelta(days=30)
+
+    users_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"premium_plan": plan, "premium_expiry": expiry_date}},
+        upsert=True,
+    )
 
 
-def add_watermark_to_image(image_path, watermark_text):
-    """Adds watermark text to an image"""
-    image = Image.open(image_path)
-    watermark = Image.new("RGBA", image.size)
-    watermark.paste(image)
-    draw = ImageDraw.Draw(watermark)
-    draw.text((10, 10), watermark_text, fill=(255, 255, 255, 128))
-    watermark.save(image_path)
-    return image_path
+async def save_user(user_id, first_name, username):
+    """Save user data to MongoDB."""
+    if not users_collection.find_one({"user_id": user_id}):
+        users_collection.insert_one({
+            "user_id": user_id,
+            "first_name": first_name,
+            "username": username,
+        })
+
+
+async def save_file_thumbnail(file_id, thumbnail_path):
+    """Save the thumbnail for a file."""
+    files_collection.update_one(
+        {"file_id": file_id},
+        {"$set": {"thumbnail": thumbnail_path}},
+        upsert=True
+    )
 
 
 # Commands
 @app.on_message(filters.command("start"))
 async def start(client, message: Message):
+    user_id = message.from_user.id
+    first_name = message.from_user.first_name
+    username = message.from_user.username
+
+    # Save user to MongoDB
+    await save_user(user_id, first_name, username)
+
     await message.reply(
-        f"👋 Hello, {message.from_user.first_name}!\n\n"
-        "Welcome to the Multi-Feature File Bot! Here's what I can do:\n"
-        "1️⃣ Rename files\n"
-        "2️⃣ Compress files\n"
-        "3️⃣ Add watermarks\n"
-        "4️⃣ Stream files\n"
-        "5️⃣ Convert formats\n"
-        "6️⃣ More!\n\n"
-        "📂 Send me any file to get started!",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📢 Visit Our Channel", url="https://t.me/pathan_botz")]]
-        ),
+        f"👋 Hello {first_name}, I can help you rename, add watermarks, compress, and stream files.\n\n"
+        "You can also manage thumbnails for files.\n\n"
+        "Send me a file to get started!"
     )
 
 
 @app.on_message(filters.document | filters.video | filters.audio | filters.photo)
 async def file_handler(client, message: Message):
+    user_id = message.from_user.id
+    is_user_premium = is_premium(user_id)
+
     file = message.document or message.video or message.audio or message.photo
+    file_name = file.file_name if hasattr(file, "file_name") else "Unnamed_File"
+    file_id = file.file_id
     file_size_mb = get_file_size_in_mb(file.file_size)
 
     # Check file size limit
@@ -74,12 +99,13 @@ async def file_handler(client, message: Message):
         await message.reply(f"⚠️ File size exceeds the limit of {MAX_FILE_SIZE_MB} MB.")
         return
 
-    # Save file info for processing
-    file_name = file.file_name if hasattr(file, "file_name") else "Unnamed_File"
-    file_id = file.file_id
-    renamed_files[file_id] = file_name
+    # Store file metadata in the database
+    files_collection.update_one(
+        {"file_id": file_id},
+        {"$set": {"file_name": file_name, "file_size": file_size_mb}},
+        upsert=True
+    )
 
-    # Show options
     await message.reply_text(
         f"📁 **File Received**: `{file_name}`\n"
         f"💾 **Size**: {file_size_mb:.2f} MB\n\n"
@@ -87,6 +113,8 @@ async def file_handler(client, message: Message):
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Rename", callback_data=f"rename|{file_id}")],
+                [InlineKeyboardButton("Add Thumbnail", callback_data=f"add_thumbnail|{file_id}")],
+                [InlineKeyboardButton("Remove Thumbnail", callback_data=f"remove_thumbnail|{file_id}")],
                 [InlineKeyboardButton("Compress", callback_data=f"compress|{file_id}")],
                 [InlineKeyboardButton("Stream", callback_data=f"stream|{file_id}")],
             ]
@@ -94,45 +122,46 @@ async def file_handler(client, message: Message):
     )
 
 
-@app.on_callback_query(filters.regex("^rename"))
-async def rename_callback(client, callback_query):
+@app.on_message(filters.photo)
+async def handle_thumbnail(message: Message):
+    """Automatically save a shared image as a thumbnail for a file."""
+    user_id = message.from_user.id
+    file_id = message.reply_to_message.document.file_id if message.reply_to_message and message.reply_to_message.document else None
+
+    if not file_id:
+        await message.reply("❌ Please reply to a file to set the thumbnail.")
+        return
+
+    # Download the image thumbnail
+    thumbnail_path = os.path.join(TEMP_DOWNLOAD_PATH, f"{file_id}_thumbnail.jpg")
+    await message.photo.download(thumbnail_path)
+
+    # Save the thumbnail for the file
+    await save_file_thumbnail(file_id, thumbnail_path)
+
+    # Notify the user
+    await message.reply("✅ Thumbnail has been successfully saved for the file!")
+
+
+@app.on_callback_query(filters.regex("^remove_thumbnail"))
+async def remove_thumbnail(client, callback_query):
+    """Handle removing thumbnail from the file."""
     file_id = callback_query.data.split("|")[1]
 
-    # Ask for new name
-    await callback_query.message.reply_text("Send me the new name for the file:")
+    # Remove the thumbnail from the file
+    await save_file_thumbnail(file_id, "")
 
-    @app.on_message(filters.text)
-    async def rename_file(client, rename_message: Message):
-        new_name = rename_message.text
-        renamed_files[file_id] = new_name
-        await callback_query.message.reply_text(f"✅ File renamed to: `{new_name}`.")
-        app.remove_handler(rename_file)
+    # Delete the thumbnail file if it exists
+    file_metadata = files_collection.find_one({"file_id": file_id})
+    if "thumbnail" in file_metadata and file_metadata["thumbnail"]:
+        thumbnail_path = file_metadata["thumbnail"]
+        if os.path.exists(thumbnail_path):
+            os.remove(thumbnail_path)
 
-
-@app.on_callback_query(filters.regex("^compress"))
-async def compress_callback(client, callback_query):
-    file_id = callback_query.data.split("|")[1]
-    file_name = renamed_files[file_id]
-    downloaded_file = await download_file(file_id, file_name)
-
-    compressed_file = compress_file(downloaded_file, file_name)
-    await callback_query.message.reply_document(compressed_file)
-    os.remove(compressed_file)  # Clean up after sending
+    await callback_query.message.edit_text("✅ Thumbnail removed from the file.")
 
 
-@app.on_callback_query(filters.regex("^stream"))
-async def stream_callback(client, callback_query):
-    file_id = callback_query.data.split("|")[1]
-    file_name = renamed_files.get(file_id, "Unnamed_File")
-
-    # Generate stream link (example Flask server URL)
-    stream_url = f"http://127.0.0.1:8000/stream/{file_id}/{file_name}"
-    await callback_query.message.reply_text(
-        f"🎥 **Stream your file here**: [Stream Now]({stream_url})",
-        disable_web_page_preview=True,
-    )
-
-
+# Run the bot
 if __name__ == "__main__":
     app.run()
-  
+    
